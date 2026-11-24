@@ -40,11 +40,15 @@ export interface WebhookVerificationOptions {
   strictRawBody?: boolean;
 
   /**
-   * When set, refuse a delivery whose `webhook-timestamp` (Unix seconds) is more
-   * than this many seconds away from now. Off by default, because the platform's
-   * retry timing is not documented and a retried delivery refused as too old is lost.
-   * Use a few minutes at least: 0 only accepts a delivery checked in the same
-   * second it was signed, which network delay alone usually misses.
+   * Refuse a delivery whose `webhook-timestamp` (Unix seconds) is more than this
+   * many seconds away from now, before or after. Default is 300 seconds (5
+   * minutes), the default `maxTimestampAgeSeconds` has for actions, so a captured
+   * signed delivery can only be replayed within that window (dedupe on
+   * `webhook-id` for the rest). Pass `Infinity` to turn the check off, including
+   * the timestamp's format, for example to verify stored deliveries later. Use a
+   * few minutes at least: 0 only accepts a delivery checked in the same second it
+   * was signed, which network delay alone usually misses (unlike
+   * `maxTimestampAgeSeconds`, 0 here doesn't mean the default).
    */
   toleranceSeconds?: number;
 }
@@ -122,16 +126,14 @@ export function webhookOptionsProblem(
   if (strict !== undefined && strict !== null && typeof strict !== 'boolean') {
     return 'strictRawBody must be true or false';
   }
-  // null means not set, like undefined.
+  // null means not set, like undefined. Infinity turns the check off.
   const tolerance = options?.toleranceSeconds;
   if (
     tolerance !== undefined &&
     tolerance !== null &&
-    (typeof tolerance !== 'number' ||
-      !Number.isFinite(tolerance) ||
-      tolerance < 0)
+    (typeof tolerance !== 'number' || Number.isNaN(tolerance) || tolerance < 0)
   ) {
-    return 'toleranceSeconds must be a finite number of seconds, zero or more';
+    return 'toleranceSeconds must be a number of seconds, zero or more, or Infinity';
   }
   return undefined;
 }

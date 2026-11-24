@@ -1,7 +1,8 @@
 import { createHmac } from 'node:crypto';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { VerifiableRequest } from '../types/verifiable-request';
 import { webhookFailureBody, webhookFailureStatus } from './config';
+import { logger } from './logger';
 import { generateHmac, verifyWebhookSubscription } from './webhook';
 
 // A known vector: produced by, and accepted by, this verifier before the
@@ -42,6 +43,13 @@ function digest(secret: string, id: string, timestamp: string, body: string) {
 const options = { secret: VECTOR.secret };
 
 describe('verifyWebhookSubscription', () => {
+  beforeEach(() => {
+    // The vector's timestamp is checked against now (five minutes by default),
+    // so every case runs at the moment it was signed unless it moves the clock.
+    vi.useFakeTimers();
+    vi.setSystemTime(Number(VECTOR.timestamp) * 1000);
+  });
+
   afterEach(() => {
     vi.useRealTimers();
   });
@@ -311,7 +319,7 @@ describe('verifyWebhookSubscription', () => {
     ).toBe(true);
   });
 
-  it('treats a null toleranceSeconds as not set and refuses a non-boolean strictRawBody', () => {
+  it('accepts a null toleranceSeconds and refuses a non-boolean strictRawBody', () => {
     expect(
       verifyWebhookSubscription(delivery(VECTOR.body), {
         ...options,
@@ -355,7 +363,7 @@ describe('verifyWebhookSubscription', () => {
   });
 
   it('returns INVALID_WEBHOOK_OPTIONS for a toleranceSeconds that would refuse everything', () => {
-    for (const toleranceSeconds of [Number.NaN, -1, Number.POSITIVE_INFINITY]) {
+    for (const toleranceSeconds of [Number.NaN, -1, Number.NEGATIVE_INFINITY]) {
       const result = verifyWebhookSubscription(delivery(VECTOR.body), {
         ...options,
         toleranceSeconds,
@@ -418,43 +426,143 @@ describe('verifyWebhookSubscription', () => {
 
   describe('toleranceSeconds', () => {
     const sentAt = Number(VECTOR.timestamp) * 1000;
+    // Refusals here warn; keep those out of the test output. The throttle
+    // test below uses a fresh module so its counts don't depend on these.
+    let warnStub: ReturnType<typeof vi.spyOn>;
+    beforeEach(() => {
+      warnStub = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    });
+    afterEach(() => {
+      warnStub.mockRestore();
+    });
 
-    it('does not check the timestamp age by default', () => {
-      vi.useFakeTimers();
-      vi.setSystemTime(sentAt + 365 * 24 * 3600 * 1000);
+    it('allows five minutes either side by default (the age verifyAction allows by default)', () => {
+      for (const offset of [-300_000, 300_000]) {
+        vi.setSystemTime(sentAt + offset);
+        expect(
+          verifyWebhookSubscription(delivery(VECTOR.body), options).success,
+        ).toBe(true);
+      }
+      for (const offset of [-301_000, 301_000, 365 * 24 * 3600 * 1000]) {
+        vi.setSystemTime(sentAt + offset);
+        expect(
+          verifyWebhookSubscription(delivery(VECTOR.body), options).error?.name,
+        ).toBe('WEBHOOK_TIMESTAMP_OUT_OF_TOLERANCE');
+      }
+    });
+
+    it('treats a null toleranceSeconds as the default', () => {
+      vi.setSystemTime(sentAt + 301_000);
+      const result = verifyWebhookSubscription(delivery(VECTOR.body), {
+        ...options,
+        toleranceSeconds: null as unknown as number,
+      });
+      expect(result.error?.name).toBe('WEBHOOK_TIMESTAMP_OUT_OF_TOLERANCE');
+    });
+
+    it('takes a wider tolerance when one is set', () => {
+      vi.setSystemTime(sentAt + 3600_000);
       expect(
-        verifyWebhookSubscription(delivery(VECTOR.body), options).success,
+        verifyWebhookSubscription(delivery(VECTOR.body), {
+          ...options,
+          toleranceSeconds: 3600,
+        }).success,
       ).toBe(true);
     });
 
-    it('accepts a timestamp within the tolerance on either side', () => {
-      vi.useFakeTimers();
-      for (const offset of [-300_000, 0, 300_000]) {
+    it('takes a narrower tolerance when one is set, on either side', () => {
+      for (const offset of [-60_000, 0, 60_000]) {
         vi.setSystemTime(sentAt + offset);
         expect(
           verifyWebhookSubscription(delivery(VECTOR.body), {
             ...options,
-            toleranceSeconds: 300,
+            toleranceSeconds: 60,
           }).success,
         ).toBe(true);
       }
-    });
-
-    it('refuses a timestamp outside the tolerance', () => {
-      vi.useFakeTimers();
-      for (const offset of [-301_000, 301_000]) {
+      for (const offset of [-61_000, 61_000]) {
         vi.setSystemTime(sentAt + offset);
         const result = verifyWebhookSubscription(delivery(VECTOR.body), {
           ...options,
-          toleranceSeconds: 300,
+          toleranceSeconds: 60,
         });
         expect(result.error?.name).toBe('WEBHOOK_TIMESTAMP_OUT_OF_TOLERANCE');
       }
     });
 
+    it('warns with the clock skew at most every ten minutes, else logs at debug', async () => {
+      vi.resetModules();
+      const fresh = await import('./webhook');
+      const freshLogger = (await import('./logger')).logger;
+      const warnLog = vi
+        .spyOn(freshLogger, 'warn')
+        .mockImplementation(() => {});
+      const debugLog = vi
+        .spyOn(freshLogger, 'debug')
+        .mockImplementation(() => {});
+      try {
+        vi.setSystemTime(sentAt + 400_000);
+        for (let i = 0; i < 3; i += 1) {
+          fresh.verifyWebhookSubscription(delivery(VECTOR.body), options);
+        }
+        expect(warnLog).toHaveBeenCalledTimes(1);
+        expect(warnLog.mock.calls[0]?.[0]).toMatchObject({
+          error: 'WEBHOOK_TIMESTAMP_OUT_OF_TOLERANCE',
+          toleranceSeconds: 300,
+          skewSeconds: 400,
+        });
+        // The warned refusal isn't logged again at debug.
+        expect(debugLog).toHaveBeenCalledTimes(2);
+
+        // Ten minutes on, a refusal warns again, so later clock drift shows.
+        // A signed timestamp that isn't whole Unix seconds also refuses every
+        // delivery, so it warns too, flagged instead of with a skew.
+        vi.setSystemTime(sentAt + 400_000 + 11 * 60_000);
+        const timestamp = '1795400000.5';
+        fresh.verifyWebhookSubscription(
+          delivery(VECTOR.body, {
+            'webhook-timestamp': timestamp,
+            'webhook-signature': `v1,${digest(VECTOR.secret, VECTOR.id, timestamp, VECTOR.body)}`,
+          }),
+          options,
+        );
+        expect(warnLog).toHaveBeenCalledTimes(2);
+        expect(warnLog.mock.calls[1]?.[0]).toMatchObject({
+          error: 'WEBHOOK_TIMESTAMP_OUT_OF_TOLERANCE',
+          malformedTimestamp: true,
+        });
+        expect(warnLog.mock.calls[1]?.[0]).not.toHaveProperty('skewSeconds');
+
+        // A clock that moved back since the last warn warns again at once.
+        vi.setSystemTime(sentAt + 400_000);
+        fresh.verifyWebhookSubscription(delivery(VECTOR.body), options);
+        expect(warnLog).toHaveBeenCalledTimes(3);
+        expect(warnLog.mock.calls[2]?.[0]).toMatchObject({ skewSeconds: 400 });
+      } finally {
+        warnLog.mockRestore();
+        debugLog.mockRestore();
+      }
+    });
+
+    it('turns the check off for Infinity, whatever the timestamp looks like', () => {
+      vi.setSystemTime(sentAt + 365 * 24 * 3600 * 1000);
+      const off = { ...options, toleranceSeconds: Number.POSITIVE_INFINITY };
+      expect(
+        verifyWebhookSubscription(delivery(VECTOR.body), off).success,
+      ).toBe(true);
+      const timestamp = '1795400000.5';
+      expect(
+        verifyWebhookSubscription(
+          delivery(VECTOR.body, {
+            'webhook-timestamp': timestamp,
+            'webhook-signature': `v1,${digest(VECTOR.secret, VECTOR.id, timestamp, VECTOR.body)}`,
+          }),
+          off,
+        ).success,
+      ).toBe(true);
+    });
+
     it('refuses a signed timestamp that is not Unix seconds', () => {
-      vi.useFakeTimers();
-      vi.setSystemTime(sentAt);
       const timestamp = '2026-11-23T00:00:00Z';
       const signature = `v1,${digest(VECTOR.secret, VECTOR.id, timestamp, VECTOR.body)}`;
       const result = verifyWebhookSubscription(
@@ -462,17 +570,16 @@ describe('verifyWebhookSubscription', () => {
           'webhook-timestamp': timestamp,
           'webhook-signature': signature,
         }),
-        { ...options, toleranceSeconds: 300 },
+        options,
       );
       expect(result.error?.name).toBe('WEBHOOK_TIMESTAMP_OUT_OF_TOLERANCE');
     });
 
     it('reports a bad signature before an old timestamp', () => {
-      vi.useFakeTimers();
       vi.setSystemTime(sentAt + 3600_000);
       const result = verifyWebhookSubscription(
         delivery(VECTOR.body, { 'webhook-signature': 'v1,bm90LXNpZ25lZA==' }),
-        { ...options, toleranceSeconds: 300 },
+        options,
       );
       expect(result.error?.name).toBe('INVALID_WEBHOOK_SIGNATURE');
     });

@@ -1,5 +1,5 @@
 import type { NextFunction, Request, Response } from 'express';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { generateHmac } from '../utils/webhook';
 import { createWebhookMiddleware } from './index';
 
@@ -49,6 +49,26 @@ function run(
 }
 
 describe('createWebhookMiddleware (Express)', () => {
+  beforeEach(() => {
+    // The signed timestamp is checked against now, so run at the moment it was signed.
+    vi.useFakeTimers();
+    vi.setSystemTime(Number(HEADERS['webhook-timestamp']) * 1000);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('refuses a delivery signed more than five minutes ago by default', () => {
+    vi.setSystemTime((Number(HEADERS['webhook-timestamp']) + 301) * 1000);
+    const { sent, next } = run(
+      request({ body: JSON.parse(BODY), rawBody: Buffer.from(BODY) }),
+    );
+    expect(next).not.toHaveBeenCalled();
+    expect(sent.status).toBe(401);
+    expect(sent.body?.name).toBe('WEBHOOK_TIMESTAMP_OUT_OF_TOLERANCE');
+  });
+
   it('verifies req.rawBody kept by a body parser verify hook', () => {
     const { sent, next } = run(
       request({ body: JSON.parse(BODY), rawBody: Buffer.from(BODY) }),

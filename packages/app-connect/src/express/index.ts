@@ -101,6 +101,10 @@ function rawWebhookBody(req: Request): {
  * Pass `strictRawBody: false` to keep the old `JSON.stringify` fallback for a
  * parsed body; a body nothing kept is still answered with 500.
  *
+ * A signed `webhook-timestamp` more than 5 minutes from now is refused with 401;
+ * set `toleranceSeconds` to widen that, or to `Infinity` to turn it off (for
+ * example to replay stored deliveries).
+ *
  * The options are read on every request, so a secret set on the object later is used.
  *
  * @throws TypeError when an option would refuse every delivery

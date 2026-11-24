@@ -23,6 +23,10 @@ export function verifyAction(
 
 /**
  * Verifies a webhook subscription request in a Next.js environment
+ *
+ * A signed `webhook-timestamp` more than 5 minutes from now is refused with
+ * `WEBHOOK_TIMESTAMP_OUT_OF_TOLERANCE`; set `toleranceSeconds` to widen that, or
+ * to `Infinity` to turn it off (for example to verify stored deliveries later).
  */
 export function verifyWebhookSubscription(
   req: VerifiableRequest,

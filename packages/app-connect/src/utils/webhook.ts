@@ -6,6 +6,7 @@ import type { VerifiableRequest } from '../types/verifiable-request';
 import { VerificationError } from '../errors/base-error';
 import {
   INVALID_WEBHOOK_OPTIONS,
+  VERIFICATION_CONSTANTS,
   WEBHOOK_RAW_BODY_REQUIRED,
   WEBHOOK_SECRET_REQUIRED,
   WEBHOOK_VERIFICATION_FAILED,
@@ -310,19 +311,29 @@ function signatureHeaderValue(value: unknown): string | undefined {
   return value === undefined || value === null ? undefined : String(value);
 }
 
-function timestampWithinTolerance(
+/**
+ * Seconds from the signed Unix timestamp to now (positive means the delivery is
+ * older), or undefined when the timestamp isn't a whole number of Unix seconds
+ * within the safe-integer range.
+ */
+function timestampSkewSeconds(
   timestamp: string,
-  toleranceSeconds: number,
-): boolean {
-  if (!/^\d+$/.test(timestamp)) {
-    return false;
-  }
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  return Math.abs(nowSeconds - Number(timestamp)) <= toleranceSeconds;
+  nowMs: number,
+): number | undefined {
+  const signedAt = /^\d+$/.test(timestamp) ? Number(timestamp) : Number.NaN;
+  return Number.isSafeInteger(signedAt)
+    ? Math.floor(nowMs / 1000) - signedAt
+    : undefined;
 }
 
 /** Setup error names already logged at error level in this process. */
 const setupErrorsLogged = new Set<string>();
+
+/** How often a timestamp refusal may be logged at warn. */
+const TIMESTAMP_WARN_INTERVAL_MS = 10 * 60 * 1000;
+
+/** When a timestamp refusal was last logged at warn in this process. */
+let lastTimestampWarnAt = Number.NEGATIVE_INFINITY;
 
 /**
  * Verifies a webhook subscription request using GoDaddy's HMAC signing mechanism
@@ -330,6 +341,10 @@ const setupErrorsLogged = new Set<string>();
  * The signature is `v1,<base64 HMAC-SHA256>` over
  * `<webhook-id>.<webhook-timestamp>.<raw body>`, keyed with the webhook secret,
  * and is compared in constant time.
+ *
+ * A signed `webhook-timestamp` more than 5 minutes from now is refused with
+ * `WEBHOOK_TIMESTAMP_OUT_OF_TOLERANCE`; set `toleranceSeconds` to widen that, or
+ * to `Infinity` to turn it off (for example to verify stored deliveries later).
  *
  * @param req The request to verify
  * @param options Options for verification including webhook secret
@@ -343,7 +358,11 @@ export function verifyWebhookSubscription(
   // The body and headers are never logged: the body can hold shopper data.
   const logContext = { correlationId, method: req.method, path: req.path };
 
-  const fail = (err: VerificationError, message: string): Result<void> => {
+  const fail = (
+    err: VerificationError,
+    message: string,
+    loggedAtWarn = false,
+  ): Result<void> => {
     // The app's own setup problems are logged as errors, with the detail the
     // adapters leave out of the response.
     if (webhookFailureStatus(err.name) === 500) {
@@ -355,7 +374,7 @@ export function verifyWebhookSubscription(
         { ...logContext, error: err.name, detail: err.message },
         message,
       );
-    } else {
+    } else if (!loggedAtWarn) {
       logger.debug({ ...logContext, error: err.name }, message);
     }
     return error(err.toJSON());
@@ -425,19 +444,49 @@ export function verifyWebhookSubscription(
       );
     }
 
-    // Checked after the signature, so only a signed timestamp is judged.
-    const toleranceSeconds = options?.toleranceSeconds;
+    // Checked after the signature, so only a signed timestamp is judged. Five
+    // minutes unless set, the default verifyAction's maxTimestampAgeSeconds has too.
+    const toleranceSeconds =
+      options?.toleranceSeconds ??
+      VERIFICATION_CONSTANTS.DEFAULT_MAX_TIMESTAMP_AGE_SECONDS;
+    const nowMs = Date.now();
+    const skewSeconds =
+      toleranceSeconds === Number.POSITIVE_INFINITY
+        ? 0
+        : timestampSkewSeconds(timestamp, nowMs);
     if (
-      toleranceSeconds !== undefined &&
-      toleranceSeconds !== null &&
-      !timestampWithinTolerance(timestamp, toleranceSeconds)
+      skewSeconds === undefined ||
+      Math.abs(skewSeconds) > toleranceSeconds
     ) {
+      // A server clock that is off, or a signed timestamp that isn't whole Unix
+      // seconds, refuses every delivery. So a refusal is logged at warn, with
+      // skewSeconds (now - signed time; positive means the delivery is older)
+      // or malformedTimestamp, at most once every ten minutes (or again at once
+      // if the clock moved back since). The rest log at debug like any 401.
+      const warn =
+        nowMs < lastTimestampWarnAt ||
+        nowMs - lastTimestampWarnAt >= TIMESTAMP_WARN_INTERVAL_MS;
+      if (warn) {
+        lastTimestampWarnAt = nowMs;
+        logger.warn(
+          {
+            ...logContext,
+            error: 'WEBHOOK_TIMESTAMP_OUT_OF_TOLERANCE',
+            toleranceSeconds,
+            ...(skewSeconds === undefined
+              ? { malformedTimestamp: true }
+              : { skewSeconds }),
+          },
+          'Webhook verification failed - signed timestamp outside tolerance (server clock skew, an unexpected timestamp format, or a late or replayed delivery)',
+        );
+      }
       return fail(
         new WebhookTimestampOutOfToleranceError({
           toleranceSeconds,
           correlationId,
         }),
         'Webhook verification failed - timestamp outside tolerance',
+        warn,
       );
     }
 

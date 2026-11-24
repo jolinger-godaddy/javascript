@@ -66,6 +66,10 @@ export function createActionMiddleware(options?: VerificationOptions) {
  * middleware already read, or an app without a webhook secret, is answered
  * with 500, because the app's setup is wrong, not the sender's.
  *
+ * A signed `webhook-timestamp` more than 5 minutes from now is refused with 401;
+ * set `toleranceSeconds` to widen that, or to `Infinity` to turn it off (for
+ * example to replay stored deliveries).
+ *
  * @throws TypeError when an option would refuse every delivery
  */
 export function createWebhookMiddleware(options?: WebhookVerificationOptions) {

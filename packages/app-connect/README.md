@@ -48,7 +48,7 @@ Verify that incoming webhook subscriptions are genuinely from the GoDaddy platfo
 
 - HMAC-SHA256 signature verification over the raw body bytes, compared in constant time
 - Support for webhook subscription verification header format, including a space-separated list of `v1,` signatures
-- Strict raw-body mode (on by default in the middleware) and an optional timestamp tolerance
+- Strict raw-body mode (on by default in the middleware) and a timestamp tolerance (5 minutes by default)
 - Express.js middleware for easy integration
 - Configurable via environment variables or runtime options
 
@@ -253,7 +253,7 @@ Verifies that a webhook subscription request has a valid HMAC signature.
 - `options`: Optional configuration
   - `secret`: the webhook secret (defaults to `GODADDY_WEBHOOK_SECRET`)
   - `strictRawBody`: refuse a body that is not a raw string or Buffer with `WEBHOOK_RAW_BODY_REQUIRED`, instead of re-serializing a parsed body with `JSON.stringify`. Off by default here; on by default in the Express and TanStack middleware
-  - `toleranceSeconds`: refuse a `webhook-timestamp` more than this many seconds from now with `WEBHOOK_TIMESTAMP_OUT_OF_TOLERANCE`. Off by default
+  - `toleranceSeconds`: refuse a `webhook-timestamp` more than this many seconds from now, before or after, with `WEBHOOK_TIMESTAMP_OUT_OF_TOLERANCE`. Default is 300 seconds (5 minutes), the default `maxTimestampAgeSeconds` has for actions, so a captured signed delivery can only be replayed within that window; dedupe on `webhook-id` for the rest. `Infinity` turns the check off, including the timestamp's format, for example to verify stored deliveries later. Unlike `maxTimestampAgeSeconds`, 0 means 0 seconds, not the default. A refusal is logged at warn at most once every ten minutes (or again at once if the clock moved back), with the measured clock skew (or `malformedTimestamp` for a signed timestamp that isn't a whole number of Unix seconds within the safe-integer range), since either one refuses every delivery
 
 The signature is `v1,<base64 HMAC-SHA256>` of `<webhook-id>.<webhook-timestamp>.<raw body>`, keyed with the secret and compared in constant time. The `webhook-signature` header may list several space-separated signatures; one match is enough. Pass the body exactly as received (for Next.js, `Buffer.from(await request.arrayBuffer())`; `request.text()` drops a byte-order mark), since a re-serialized body can differ from what was signed. Direct calls, including the Next.js export, keep `strictRawBody` off unless you pass it, so pass `strictRawBody: true` once your route hands over raw bytes.
 
@@ -336,7 +336,7 @@ The library exports standardized error types that follow GoDaddy's error schema:
 - `WebhookRawBodyRequiredError`: When `strictRawBody` is on and the raw body is unavailable (the middleware answers 500)
 - `WebhookSecretRequiredError`: When no webhook secret is configured (the middleware answers 500)
 - `InvalidWebhookOptionsError`: When an option would refuse every delivery, such as a negative `toleranceSeconds` (the middleware throws when created)
-- `WebhookTimestampOutOfToleranceError`: When `toleranceSeconds` is set and the timestamp is outside it
+- `WebhookTimestampOutOfToleranceError`: When the timestamp is outside `toleranceSeconds` (5 minutes by default)
 - `WebhookVerificationFailedError`: When verification failed inside the app, such as a body that can't be serialized (the middleware answers 500)
 
 `webhookFailureStatus(name)` and `webhookFailureBody(error)` give the status and body the middleware answers with, for handlers that call `verifyWebhookSubscription` directly.
